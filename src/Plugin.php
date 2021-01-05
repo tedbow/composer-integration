@@ -10,7 +10,8 @@ use Composer\Plugin\PluginInterface;
 use Composer\Repository\RepositoryFactory;
 use Composer\Repository\RepositoryManager;
 use Composer\Util\ProcessExecutor;
-use Tuf\ComposerIntegration\Repository\TufValidatedComposerRepository;
+use Tuf\ComposerIntegration\Repository\TufHttpAwareRepositoryManager;
+use Tuf\ComposerIntegration\Util\TufValidatedHttpDownloader;
 
 
 class Plugin implements PluginInterface
@@ -18,20 +19,21 @@ class Plugin implements PluginInterface
     public function activate(Composer $composer, IOInterface $io)
     {
         // Credit for this pattern to zaporylie/composer-drupal-optimizations.
-        // These three instantiations satisfy strict types on RepositoryFactory::manager() only.
+        // These three instantiations satisfy strict types on TufAwareHttpRepositoryManager::__construct only.
         // They are overwritten with the instances used by the rest of Composer inside the closure.
         $httpDownloader = Factory::createHttpDownloader($io, $composer->getConfig());
         $process = new ProcessExecutor($io);
         $dispatcher = new EventDispatcher($composer, $io, $process);
 
-        $manager = RepositoryFactory::manager($io, $composer->getConfig(), $httpDownloader, $dispatcher, $process);
-        $setRepositories = \Closure::bind(function (RepositoryManager $manager) {
+        $manager = new TufHttpAwareRepositoryManager($io, $composer->getConfig(), $httpDownloader, $dispatcher, $process);
+        $manager->setTufValidatedHttpDownloader(new TufValidatedHttpDownloader($io, $composer->getConfig()));
+
+        $fixupRepositoryManager = \Closure::bind(function (RepositoryManager $manager) {
             $manager->httpDownloader = $this->httpDownloader;
             $manager->eventDispatcher = $this->eventDispatcher;
             $manager->process = $this->process;
 
             $manager->repositoryClasses = $this->repositoryClasses;
-            $manager->setRepositoryClass('composer', TufValidatedComposerRepository::class);
             $manager->repositories = $this->repositories;
             $i = 0;
             foreach (RepositoryFactory::defaultRepos(null, $this->config, $manager) as $repo) {
@@ -39,7 +41,7 @@ class Plugin implements PluginInterface
             }
             $manager->setLocalRepository($this->getLocalRepository());
         }, $composer->getRepositoryManager(), RepositoryManager::class);
-        $setRepositories($manager);
+        $fixupRepositoryManager($manager);
 
         $composer->setRepositoryManager($manager);
     }

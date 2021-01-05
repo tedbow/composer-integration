@@ -14,7 +14,9 @@ use Composer\Plugin\PreFileDownloadEvent;
 use Composer\Repository\ComposerRepository;
 use Composer\Repository\RepositorySecurityException;
 use Composer\Util\Filesystem;
+use Composer\Util\Http\Response;
 use Composer\Util\HttpDownloader;
+use React\Promise\Promise;
 use Tuf\Client\DurableStorage\FileStorage;
 use Tuf\Client\Updater;
 use Tuf\Exception\TufException;
@@ -29,12 +31,10 @@ class TufValidatedComposerRepository extends ComposerRepository
     protected $isValidated;
 
     /**
-     * @var array
-     *   Cache to short-circuit TUF operations when accessing the Composer root metadata.
-     *
-     *   Serves same purpose as parent::$rootData, but its visibility is private.
+     * @var bool
+     *   Indicates whether a refresh() has been performed on our TUF metadata.
      */
-    protected $tufValidatedRootData;
+    protected $isRefreshed = false;
 
     /**
      * @var array
@@ -130,49 +130,16 @@ class TufValidatedComposerRepository extends ComposerRepository
 
     protected function loadRootServerFile()
     {
-        if (!$this->isValidated) {
-            return parent::loadRootServerFile();
+        if ($this->isValidated && !$this->isRefreshed) {
+            try {
+                $this->tufRepo->refresh();
+                $this->isRefreshed = true;
+            } catch (TufException $e) {
+                throw new RepositorySecurityException('TUF secure error: ' . $e->getMessage(), $e->getCode(), $e);
+            }
         }
 
-        if (null !== $this->tufValidatedRootData) {
-            return $this->tufValidatedRootData;
-        }
-
-        $jsonUrlParts = parse_url($this->composerRepoUrl);
-
-        if (isset($jsonUrlParts['path']) && false !== strpos($jsonUrlParts['path'], '.json')) {
-            $jsonUrl = $this->composerRepoUrl;
-        } else {
-            $jsonUrl = $this->composerRepoUrl . '/root.json';
-        }
-
-        try {
-            $this->tufRepo->refresh();
-        } catch (TufException $e) {
-            throw new RepositorySecurityException('TUF secure error: ' . $e->getMessage(), $e->getCode(), $e);
-        }
-
-        // fetchFile() will throw a RepositorySecurityException if the hash doesn't match.
-        $data = $this->fetchFile($jsonUrl, 'root.json');
-
-        if (!empty($data['providers-url'])) {
-            $this->providersUrl = $this->canonicalizeUrl($data['providers-url']);
-            $this->hasProviders = true;
-        }
-
-        if (!empty($data['list'])) {
-            $this->listUrl = $this->canonicalizeUrl($data['list']);
-        }
-
-        if (!empty($data['providers']) || !empty($data['providers-includes'])) {
-            $this->hasProviders = true;
-        }
-
-        if (!empty($data['providers-api'])) {
-            $this->providersApiUrl = $this->canonicalizeUrl($data['providers-api']);
-        }
-
-        return $this->tufValidatedRootData = $data;
+        return parent::loadRootServerFile();
     }
 
     /**
@@ -290,6 +257,127 @@ class TufValidatedComposerRepository extends ComposerRepository
         }
 
         return $data;
+    }
+
+    protected function asyncFetchFile($filename, $cacheKey, $lastModifiedTime = null)
+    {
+        if (! $this->isValidated) {
+            return parent::asyncFetchFile($filename, $cacheKey, $lastModifiedTime);
+        }
+
+        $retries = 3;
+
+        if (isset($this->packagesNotFoundCache[$filename])) {
+            return \React\Promise\resolve(array('packages' => array()));
+        }
+
+        if (isset($this->freshMetadataUrls[$filename]) && $lastModifiedTime) {
+            // make it look like we got a 304 response
+            return \React\Promise\resolve(true);
+        }
+
+        $httpDownloader = $this->httpDownloader;
+        if ($this->eventDispatcher) {
+            $preFileDownloadEvent = new PreFileDownloadEvent(PluginEvents::PRE_FILE_DOWNLOAD, $this->httpDownloader, $filename, 'metadata');
+            $this->eventDispatcher->dispatch($preFileDownloadEvent->getName(), $preFileDownloadEvent);
+            $filename = $preFileDownloadEvent->getProcessedUrl();
+        }
+
+        $options = $this->options;
+        if ($lastModifiedTime) {
+            if (isset($options['http']['header'])) {
+                $options['http']['header'] = (array) $options['http']['header'];
+            }
+            $options['http']['header'][] = 'If-Modified-Since: '.$lastModifiedTime;
+        }
+
+        $io = $this->io;
+        $url = $this->composerRepoUrl;
+        $cache = $this->cache;
+        $degradedMode =& $this->degradedMode;
+        $repo = $this;
+
+        $accept = function ($response) use ($io, $url, $filename, $cache, $cacheKey, $repo) {
+            // package not found is acceptable for a v2 protocol repository
+            if ($response->getStatusCode() === 404) {
+                $repo->packagesNotFoundCache[$filename] = true;
+                return array('packages' => array());
+            }
+
+            $json = $response->getBody();
+            if ($json === '' && $response->getStatusCode() === 304) {
+                $repo->freshMetadataUrls[$filename] = true;
+                return true;
+            }
+
+            $data = $response->decodeJson();
+            HttpDownloader::outputWarnings($io, $url, $data);
+
+            $lastModifiedDate = $response->getHeader('last-modified');
+            $response->collect();
+            if ($lastModifiedDate) {
+                $data['last-modified'] = $lastModifiedDate;
+                $json = JsonFile::encode($data, JsonFile::JSON_UNESCAPED_SLASHES | JsonFile::JSON_UNESCAPED_UNICODE);
+            }
+            if (!$cache->isReadOnly()) {
+                $cache->write($cacheKey, $json);
+            }
+            $repo->freshMetadataUrls[$filename] = true;
+
+            return $data;
+        };
+
+        $reject = function ($e) use (&$retries, $httpDownloader, $filename, $options, &$reject, $accept, $io, $url, &$degradedMode, $repo) {
+            if ($e instanceof TransportException && $e->getStatusCode() === 404) {
+                $repo->packagesNotFoundCache[$filename] = true;
+                return false;
+            }
+
+            // special error code returned when network is being artificially disabled
+            if ($e instanceof TransportException && $e->getStatusCode() === 499) {
+                $retries = 0;
+            }
+
+            if (--$retries > 0) {
+                usleep(100000);
+
+                return $httpDownloader->add($filename, $options)->then($accept, $reject);
+            }
+
+            if (!$degradedMode) {
+                $io->writeError('<warning>'.$url.' could not be fully loaded ('.$e->getMessage().'), package information was loaded from the local cache and may be out of date</warning>');
+            }
+            $degradedMode = true;
+
+            // special error code returned when network is being artificially disabled
+            if ($e instanceof TransportException && $e->getStatusCode() === 499) {
+                return $accept(new Response(array('url' => $url), 404, array(), ''));
+            }
+
+            throw $e;
+        };
+
+        $tufAccept = function($targetInfo) use($httpDownloader, $filename, $options) {
+            return $httpDownloader->add($filename, $options);
+        };
+
+        $tufReject = function($e) {
+            throw $e;
+        };
+
+        return $this->addInitialPromise($filename)->then($tufAccept, $tufReject)->then($accept, $reject);
+    }
+
+    protected function addInitialPromise($filename) {
+        $io = $this->io;
+        $bsResolver = function ($resolve, $reject) use($io, $filename) {
+            $io->info("Waiting 1 second before starting async access to $filename");
+            sleep(1);
+            $resolve(true);
+        };
+
+        $initialPromise = new Promise($bsResolver, null);
+        return $initialPromise;
     }
 
     /**
