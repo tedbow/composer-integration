@@ -5,9 +5,12 @@ namespace Tuf\ComposerIntegration;
 use Composer\Composer;
 use Composer\IO\IOInterface;
 use Composer\Plugin\PluginInterface;
+use Composer\Plugin\PostFileDownloadEvent;
 use Composer\Repository\ComposerRepository;
 use Composer\Repository\RepositoryFactory;
 use Composer\Repository\RepositoryManager;
+use Composer\Repository\RepositorySecurityException;
+use Tuf\Client\Updater;
 use Tuf\ComposerIntegration\Repository\TufValidatedComposerRepository;
 
 class Plugin implements PluginInterface
@@ -47,6 +50,19 @@ class Plugin implements PluginInterface
                 $repository = new TufValidatedComposerRepository($repository->getRepoConfig(), $io, $composer->getConfig(), $composer->getLoop()->getHttpDownloader(), $composer->getEventDispatcher());
             }
             $manager->addRepository($repository);
+        }
+    }
+
+    public function postFileDownload(PostFileDownloadEvent $event)
+    {
+        $package = $event->getPackage();
+        if (isset($package->tufRepo) && $package->tufRepo instanceof Updater) {
+            $tufTargetInfo = $package->tufRepo->getOneValidTargetInfo($event->getUrl());
+
+            $fileName = $event->getFileName();
+            if (hash_file('sha256', $fileName) !== $tufTargetInfo['hashes']['sha256']) {
+                throw new RepositorySecurityException('Downloaded file has does not agree with TUF: ' . $fileName);
+            }
         }
     }
 

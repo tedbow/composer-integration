@@ -5,6 +5,7 @@ namespace Tuf\ComposerIntegration\Repository;
 use Composer\Config;
 use Composer\EventDispatcher\EventDispatcher;
 use Composer\IO\IOInterface;
+use Composer\Package\PackageInterface;
 use Composer\Repository\ComposerRepository;
 use Composer\Repository\RepositorySecurityException;
 use Composer\Util\Filesystem;
@@ -90,5 +91,50 @@ class TufValidatedComposerRepository extends ComposerRepository
             $sha256 = $tufTargetInfo['hashes']['sha256'];
         }
         return parent::fetchFile($filename, $cacheKey, $sha256, $storeLastModifiedTime);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function findPackage($name, $constraint)
+    {
+        return $this->decorate(parent::findPackage($name, $constraint));
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function findPackages($name, $constraint = null)
+    {
+        return $this->decorateMultiple(parent::findPackages($name, $constraint));
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function getPackages()
+    {
+        return $this->decorateMultiple(parent::getPackages());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function loadPackages(array $packageNameMap, array $acceptableStabilities, array $stabilityFlags, array $alreadyLoaded = array())
+    {
+        $packages = parent::loadPackages($packageNameMap, $acceptableStabilities, $stabilityFlags, $alreadyLoaded);
+        $packages['packages'] = $this->decorateMultiple($packages['packages']);
+        return $packages;
+    }
+
+    private function decorateMultiple(array $packages)
+    {
+        return array_map([$this, 'decorate'], $packages);
+    }
+
+    private function decorate(PackageInterface $package = NULL)
+    {
+        $package->tufRepo = $this->tufRepo;
+        return $package;
     }
 }
