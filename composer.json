@@ -58,6 +58,6 @@
             "cp -f ./vendor/php-tuf/php-tuf/Pipfile* .",
             "ln -s -f ./targets/packages.json ."
         ],
-        "test": "phpunit ./tests"
+        "test": "phpunit --coverage-text ./tests"
     }
 }
